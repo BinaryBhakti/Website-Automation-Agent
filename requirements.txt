@@ -1,4 +1,4 @@
 # Core dependencies for the Website Automation Agent
-# No AI/LLM API key is required — element detection is fully deterministic.
+google-genai>=1.0.0    # Google Gemini API SDK (AI reasoning + vision)
 playwright>=1.40.0     # Browser automation library
-python-dotenv>=1.0.0   # Loads configuration from a .env file (optional)
+python-dotenv>=1.0.0   # Loads API key / config from a .env file

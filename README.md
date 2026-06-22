@@ -1,56 +1,57 @@
 # Website Automation Agent
 
-An intelligent browser-automation agent — a mini version of tools like
-[Browser Use](https://github.com/browser-use/browser-use). It controls a real
-Chromium browser through [Playwright](https://playwright.dev/) and autonomously
-fills a web form.
+An intelligent, **AI-driven** browser-automation agent — a mini version of tools
+like [Browser Use](https://github.com/browser-use/browser-use). It controls a
+real Chromium browser through [Playwright](https://playwright.dev/) and uses
+**Google Gemini** to do the actual thinking.
 
-**No API key. No LLM. No cost.** Element detection is fully deterministic, so the
-agent runs anywhere, every time — ideal for a reliable live demo.
+The agent is genuinely autonomous: **the model decides everything** — which
+element is the Name field, which is the Description field, what to type, when to
+scroll, and when the task is done. None of those decisions are hard-coded; the
+Python code only carries out the browser actions the AI asks for and shows it the
+result.
 
 Given a target page, the agent:
 
 1. Opens a browser and navigates to the URL.
-2. Intelligently identifies the form's **Name** and **Description** fields.
-3. Fills them in — no hard-coded selectors, no manual intervention.
+2. Looks at the page (screenshots + raw field data) and **reasons** about the form.
+3. Fills the Name and Description fields — no hard-coded selectors, no manual steps.
 
 > **Target task:** navigate to
-> `https://ui.shadcn.com/docs/forms/react-hook-form`, find the Name and
+> `https://ui.shadcn.com/docs/forms/react-hook-form`, identify the Name and
 > Description fields, and fill them automatically.
 >
 > On the live page the primary field is labelled **"Bug Title"** (not literally
-> "Name"). The agent handles this — it matches the closest equivalent field by
-> label/placeholder/name and falls back to the form's primary text input, so it
-> still completes the task.
+> "Name"). The AI works that out on its own from the labels and field types.
 
 ---
 
-## How it works (in one picture)
+## How it works (the agent loop)
 
 ```
             ┌──────────────────────────────────────────────┐
             │                  main.py                      │
-            │   load config · setup logging · run agent     │
+            │   load config · setup logging · run loop      │
             └───────────────┬──────────────────────────────┘
                             │
-              ┌─────────────▼─────────────┐      composes the tools:
+              ┌─────────────▼─────────────┐   calls a tool each turn
               │     AutomationAgent       │  ───────────────────────────────►
-              │  deterministic decision   │   open_browser, navigate_to_url,
-              │  logic: detect → score →  │   take_screenshot, get_form_fields,
-              │  decide → fill → verify   │   click_on_screen, double_click,
-              └─────────────┬─────────────┘   send_keys, scroll
-                            │  field data + screenshots
+              │  Gemini reasons over the  │   open_browser, navigate_to_url,
+              │  screenshot + field data, │   take_screenshot, get_form_fields,
+              │  then DECIDES the action  │   click_on_screen, double_click,
+              └─────────────┬─────────────┘   send_keys, scroll, finish
+                            │  result + fresh screenshot
               ┌─────────────▼─────────────┐  ◄───────────────────────────────
               │     BrowserController      │
               │   (Playwright / Chromium) │
               └───────────────────────────┘
 ```
 
-The agent **detects** every field (via the page's own DOM: labels, placeholders,
-names, types + centre coordinates), **scores** each one to decide which is the
-Name field and which is the Description field, then **acts** (coordinate click +
-type) and **verifies** the result. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for
-the full design write-up.
+Every turn: Gemini **sees** the page (the screenshot is sent to the model as an
+image), **thinks**, and **acts** (emits a function call). We run that tool and
+return the result — plus a fresh screenshot — so the model perceives the new
+state. The loop repeats until the model calls `finish`. See
+[`ARCHITECTURE.md`](ARCHITECTURE.md) for the full design write-up.
 
 ---
 
@@ -65,12 +66,12 @@ the full design write-up.
 | `double_click`     | `BrowserController.double_click`                          |
 | `send_keys`        | `BrowserController.send_keys`                             |
 | `scroll`           | `BrowserController.scroll`                                |
-| *(bonus)* `get_form_fields` | intelligent element detection used to find fields |
+| *(bonus)* `get_form_fields` | raw element data the AI reasons over             |
 
-All seven required tools are real, composable methods. The agent uses
-`click_on_screen(x, y)` with coordinates discovered by `get_form_fields`,
-`scroll` when a field is below the fold, and `double_click` when a field already
-contains text (to select it before overwriting).
+The tools are exposed to Gemini as **function declarations**; the model chooses
+which to call and with what arguments. It clicks via `click_on_screen(x, y)` using
+coordinates from `get_form_fields`, `scroll`s when a field is below the fold, and
+uses `double_click` when it judges it necessary.
 
 ---
 
@@ -78,7 +79,7 @@ contains text (to select it before overwriting).
 
 ### 1. Prerequisites
 - **Python 3.10+** (tested on 3.13)
-- That's it — **no API key required.**
+- A **Google Gemini API key** — <https://aistudio.google.com/apikey>
 
 ### 2. Install dependencies
 
@@ -96,16 +97,21 @@ pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
-### 3. (Optional) Configure
-
-The agent runs with sensible defaults. Only create a `.env` if you want to change
-the target URL, the values it types, or the browser mode:
+### 3. Configure
 
 ```bash
+# copy the template and fill in your key
 cp .env.example .env      # Windows: copy .env.example .env
 ```
 
-See `.env.example` for every option.
+Edit `.env` and set at least:
+
+```dotenv
+GEMINI_API_KEY=AIza...
+```
+
+Everything else has sensible defaults (model, target URL, the free-form task,
+headless mode, viewport, step limit). See `.env.example` for the full list.
 
 ---
 
@@ -116,29 +122,27 @@ python main.py
 ```
 
 With `HEADLESS=false` (the default) a real browser window opens so you can watch
-the agent work — ideal for a live demo. Set `HEADLESS=true` to run invisibly.
+the agent reason and act — ideal for a live demo. Set `HEADLESS=true` to run
+invisibly.
 
 ### What you'll see
-- Live, structured logs of every decision and action in the terminal.
-- An `artifacts/` folder containing:
-  - **screenshots** before and after filling (`01_before_fill.png`, `02_after_fill.png`),
-  - a `final_state.png`,
-  - a full `agent.log`.
+- Live, structured logs of every decision and action — including the model's own
+  reasoning text.
+- An `artifacts/` folder with numbered **screenshots** per step, a
+  `final_state.png`, and a full `agent.log`.
 
-Real log excerpt from a run against the live page:
+Example log excerpt:
 
 ```
-INFO agent.browser Navigating to https://ui.shadcn.com/docs/forms/react-hook-form
-INFO agent.brain   Loaded page: React Hook Form - shadcn/ui
-INFO agent.browser Saved screenshot -> artifacts/01_before_fill.png
-INFO agent.brain   No description field visible yet; scrolling to look further down.
-INFO agent.browser Scroll down by 400
-INFO agent.brain   Detected description field -> label='Description' at (640, 524) [score=12.0]
-INFO agent.brain   Detected name field -> label='Bug Title' at (640, 398) [score=5.0]
-INFO agent.browser Click at (640, 398)
-INFO agent.browser Typing 'Login button broken on mobile' (clear_first=True)
-INFO agent.brain   Verify name field -> value now: 'Login button broken on mobile'
-INFO agent.brain   ✅ Filled 2 field(s): Name, Description.
+INFO agent.brain   ─── Step 3/30 ───
+INFO agent.brain   🤖 The form has a "Bug Title" input and a "Description" textarea.
+                       I'll treat Bug Title as the Name field.
+INFO agent.brain   Tool call: click_on_screen(x=640, y=398)
+INFO agent.brain   Tool call: send_keys(text='Login button broken on mobile', clear_first=True)
+INFO agent.brain   Tool call: scroll(direction='down', amount=400)
+INFO agent.brain   Tool call: get_form_fields()
+INFO agent.brain   Tool call: send_keys(text='The button does not respond on small screens.')
+INFO agent.brain   ✅ Agent finished: Filled the Bug Title and Description fields.
 ```
 
 ---
@@ -150,13 +154,14 @@ INFO agent.brain   ✅ Filled 2 field(s): Name, Description.
 ├── main.py               # entry point: config, logging, run the agent
 ├── config.py             # env-var driven settings (Settings dataclass)
 ├── requirements.txt
-├── .env.example          # optional configuration template
+├── .env.example          # configuration template
 ├── README.md
 ├── ARCHITECTURE.md       # design decisions & agent workflow
 └── agent/
     ├── __init__.py
     ├── browser_tools.py  # Playwright wrapper = the tool implementations
-    └── agent.py          # deterministic detect → decide → fill logic
+    ├── tool_schemas.py   # function declarations handed to Gemini
+    └── agent.py          # the Gemini reasoning loop (the "brain")
 ```
 
 ---
@@ -165,12 +170,14 @@ INFO agent.brain   ✅ Filled 2 field(s): Name, Description.
 
 | Variable            | Default                                               | Meaning                                  |
 | ------------------- | ----------------------------------------------------- | ---------------------------------------- |
+| `GEMINI_API_KEY`    | *(required)*                                          | Your Google Gemini API key               |
+| `GEMINI_MODEL`      | `gemini-2.5-flash`                                    | Model used for reasoning + vision        |
 | `TARGET_URL`        | `https://ui.shadcn.com/docs/forms/react-hook-form`    | Page to automate                         |
-| `NAME_VALUE`        | `Jane Doe`                                             | Text typed into the Name field           |
-| `DESCRIPTION_VALUE` | *(a default sentence)*                                | Text typed into the Description field     |
+| `TASK`              | *(fill Name + Description)*                            | Free-form goal the AI decides how to do  |
 | `HEADLESS`          | `false`                                               | Show (`false`) or hide (`true`) the browser |
 | `VIEWPORT_WIDTH`    | `1280`                                                | Browser width (px)                       |
 | `VIEWPORT_HEIGHT`   | `800`                                                 | Browser height (px)                      |
+| `MAX_STEPS`         | `30`                                                  | Safety cap on agent iterations           |
 | `ACTION_TIMEOUT_MS` | `30000`                                               | Per-action timeout (ms)                  |
 | `ARTIFACTS_DIR`     | `artifacts`                                           | Where screenshots + logs are written     |
 
@@ -180,17 +187,16 @@ INFO agent.brain   ✅ Filled 2 field(s): Name, Description.
 
 | Symptom | Fix |
 | ------- | --- |
+| `GEMINI_API_KEY is not set` | Create `.env` from `.env.example` and add your key. |
 | `playwright ... Executable doesn't exist` | Run `python -m playwright install chromium`. |
 | Browser never opens | Ensure `HEADLESS=false`; check the log for launch errors. |
-| The page label isn't literally "Name" | Expected — the live page uses "Bug Title". The agent matches by keyword (name/title/subject) and falls back to the primary text input, so it still fills the form. |
-| Page slow to load / timeout | Increase `ACTION_TIMEOUT_MS` in `.env`. |
+| Agent loops or stops early | Raise `MAX_STEPS`, or try `GEMINI_MODEL=gemini-2.5-pro` for harder pages. |
 
 ---
 
 ## Notes on safety & scope
 
-- The agent **does not submit** the form — it only fills the fields, matching the
-  assignment.
-- Errors (timeouts, missing elements, out-of-viewport clicks) are caught and
-  logged so the agent fails gracefully instead of crashing.
-- No secrets, no network calls to any third-party API.
+- The agent is instructed **not to submit** the form — it only fills the fields.
+- The API key is read from the environment only and is never logged.
+- Errors (timeouts, missing elements, out-of-viewport clicks) are caught and fed
+  back to the model as tool errors so it can adapt instead of crashing.

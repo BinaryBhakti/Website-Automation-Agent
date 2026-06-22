@@ -48,8 +48,8 @@ def main() -> int:
         log.error("Configuration error: %s", exc)
         return 1
 
-    log.info("Website Automation Agent starting up (deterministic, no API key).")
-    log.info("Target: %s", settings.target_url)
+    log.info("Website Automation Agent starting up (AI-driven via Gemini).")
+    log.info("Model: %s | Target: %s", settings.model, settings.target_url)
     log.info("Headless: %s | Viewport: %sx%s",
              settings.headless, settings.viewport_width, settings.viewport_height)
 

@@ -1,7 +1,7 @@
 # Architecture & Design
 
 This document explains the design decisions behind the Website Automation Agent
-and walks through how the agent perceives, decides, and acts.
+and walks through how the agent perceives, thinks, and acts.
 
 ---
 
@@ -10,33 +10,27 @@ and walks through how the agent perceives, decides, and acts.
 Build an autonomous agent that drives a real browser to complete a web task —
 finding and filling the **Name** and **Description** form fields on
 `https://ui.shadcn.com/docs/forms/react-hook-form` — without hard-coded scripts
-or human intervention. The agent must reason about the page and decide which
-element is which, the way a person would.
-
-A key constraint we chose deliberately: **no LLM / API key.** The required task
-(navigate → identify two fields → fill them) is fully solvable with browser
-automation plus intelligent, deterministic element detection — which the
-assignment explicitly allows ("intelligent element identification using
-selectors, XPath, or visual recognition"). This makes the agent free, offline,
-and 100% reliable for a live demo, where an LLM call would add cost, latency, and
-a network failure point.
+or human intervention. Crucially, the *decisions* (which element is which, what
+to type, when to scroll, when it is done) are made by an **AI model**, not by
+fixed rules in our code.
 
 ---
 
 ## 2. Design principles
 
-1. **Separation of concerns.** The "hands" (browser control) and the "brain"
-   (decision-making) are independent modules. Either can change without touching
-   the other.
-2. **Modular, composable tools.** Each capability is a small, single-purpose
-   method with a clear contract — exactly the toolbox the assignment asks for.
-3. **Transparent intelligence.** Field detection is a readable scoring model, not
-   a black box. Every score and decision is logged, so a reviewer can see *why*
-   the agent chose each field.
-4. **Fail soft.** Tool failures raise a typed `ToolError` that the agent handles;
-   the process never crashes on an expected error.
-5. **Observable.** Every decision and action is logged, and the run produces
-   before/after screenshots, so it is fully auditable during the viva.
+1. **The AI does the thinking.** The agent code is "hands and eyes"; Google
+   Gemini is the "brain". We never hard-code which field is the Name field or
+   what to type — the model reasons it out from what it sees.
+2. **Separation of concerns.** Browser control and decision-making are
+   independent modules. You can swap the model or the browser layer in isolation.
+3. **Modular, composable tools.** Each capability is a small, single-purpose
+   function exposed to the model as a typed tool — exactly the toolbox the
+   assignment asks for.
+4. **Perceive → decide → act loop.** After every action the model receives a
+   fresh screenshot, so it always reasons over the current page state.
+5. **Fail soft & observable.** Tool failures become feedback to the model (not
+   crashes); every decision, action and the model's own reasoning is logged, and
+   each step is saved as a screenshot for a fully auditable run.
 
 ---
 
@@ -45,11 +39,12 @@ a network failure point.
 ```
 config.py              Settings dataclass sourced from environment variables.
 agent/browser_tools.py BrowserController — the Playwright-backed tool implementations.
-agent/agent.py         AutomationAgent — deterministic detect → decide → fill logic.
+agent/tool_schemas.py  Gemini function declarations for those tools.
+agent/agent.py         AutomationAgent — the Gemini reasoning / function-calling loop.
 main.py                Wiring: config + logging + lifecycle.
 ```
 
-### 3.1 `BrowserController` (the hands)
+### 3.1 `BrowserController` (the hands & eyes)
 A stateful wrapper around a single Playwright Chromium page, used as a context
 manager so the browser is always cleaned up. It implements the required tools:
 
@@ -57,78 +52,76 @@ manager so the browser is always cleaned up. It implements the required tools:
 | ---- | --------------------- |
 | `open_browser` | Launches Chromium with `device_scale_factor=1` so screenshot pixels map **1:1** to click coordinates. |
 | `navigate_to_url` | `goto(..., wait_until="domcontentloaded")` then settles on network idle. |
-| `take_screenshot` | Saves a numbered PNG to `artifacts/` (and returns base64 for programmatic use). |
+| `take_screenshot` | Returns base64 PNG (sent to the model as an image) **and** saves a numbered file to `artifacts/`. |
 | `click_on_screen(x, y)` | `mouse.click`, guarded against out-of-viewport coordinates. |
-| `double_click(x, y)` | `mouse.dblclick` — used to select existing text before overwriting. |
+| `double_click(x, y)` | `mouse.dblclick` — to select existing text before overwriting. |
 | `send_keys(text, …)` | Types into the focused element; optional `clear_first` / `press_enter`. |
 | `scroll(direction, amount)` | `mouse.wheel` in any direction. |
-| `get_form_fields` | Runs JS in the page to enumerate visible inputs/textareas with their label, placeholder, name, id, type, value **and centre coordinates**. |
+| `get_form_fields` | Runs JS in the page to enumerate visible inputs/textareas with label, placeholder, name, id, type, value **and centre coordinates** — raw data the model reasons over. |
 
-### 3.2 `AutomationAgent` (the brain)
-A deterministic workflow that composes the tools and makes its own decisions.
+### 3.2 `tool_schemas.py` (the contract)
+Gemini `FunctionDeclaration` definitions, one per tool. The descriptions are
+written *for the model*: they explain what each tool does and nudge it to read
+`get_form_fields` and decide for itself which field is which. The model picks the
+tool and the arguments — the schemas never encode the answer.
 
-**The intelligence is a scoring model.** For each target role ("name" or
-"description") it scores every detected field by summing keyword weights found
-across the field's combined text signals (label + placeholder + name + id +
-aria-label), plus a small structural bonus:
+### 3.3 `AutomationAgent` (the brain loop)
+A manual [function-calling loop](https://ai.google.dev/gemini-api/docs/function-calling)
+against the Gemini API (`google-genai` SDK):
 
-- A `<textarea>` gets a bonus toward **Description** (long, descriptive text).
-- A single-line text `<input>` gets a bonus toward **Name** (a short identifier).
+- **System prompt** frames the task and the general method, then explicitly hands
+  the decisions to the model ("you — not any script — decide which element is
+  which and what to type").
+- Each turn we send the running conversation; Gemini returns one or more
+  `function_call` parts (plus optional reasoning text, which we log).
+- We dispatch each call to the matching `BrowserController` method and return a
+  `function_response`. For visually-significant actions we also attach a **fresh
+  screenshot** so the model perceives the new state.
+- The loop ends when the model calls `finish`, or at `MAX_STEPS` (a safety cap).
 
-The highest-scoring field above zero wins. Two robustness layers handle real
-pages:
-
-- **Exclusion** — the Description is matched first (its keyword is highly
-  specific); the Name match then excludes it so the two can never collide.
-- **Primary-text fallback** — if no field matches a name/title/subject keyword
-  (as on the live page, where the field is labelled *"Bug Title"*), the agent
-  falls back to the topmost single-line text input, i.e. the form's primary
-  identifier.
+Because the SDK is given *declarations* (not Python callables), automatic
+function calling is off — we run the manual loop, which keeps every action
+logged and lets us inject screenshots between turns.
 
 ---
 
-## 4. Agent workflow
+## 4. Agent workflow (a typical run)
 
 ```
-open_browser
-   └─► navigate_to_url(TARGET_URL)
-         └─► take_screenshot("before_fill")
-               └─► get_form_fields()  ──► score every field
-                     ├─ locate Description  (keyword "description" + textarea bonus)
-                     ├─ locate Name/primary (keyword name/title… else primary-text fallback)
-                     ├─► fill Name:        click_on_screen(x,y) → send_keys(clear_first)
-                     ├─► fill Description: click_on_screen(x,y) → send_keys(clear_first)
-                     ├─► verify (re-read field values)
-                     └─► take_screenshot("after_fill") → done
+[model] open_browser
+[model] navigate_to_url(TARGET_URL)             ← screenshot returned
+[model] get_form_fields()                        ← raw fields + coordinates
+[model] reasons: "Bug Title" = primary/name, "Description" textarea = description
+[model] click_on_screen(name.x, name.y) → send_keys("…", clear_first=true)
+[model] scroll(down) → get_form_fields()         ← description was below the fold
+[model] click_on_screen(desc.x, desc.y) → send_keys("…")
+[model] get_form_fields() / take_screenshot()    ← verifies the values
+[model] finish("Filled the title and description fields.")
 ```
 
-If a target field is below the fold, `get_form_fields` returns nothing for it, so
-the agent `scroll`s down once and **re-detects** — coordinates are
-viewport-relative and change after scrolling. (On the live page the Description
-field is below the fold, so this path runs on every real run.)
-
-If a field already contains text, the agent `double_click`s it (to select a word)
-before typing — demonstrating that tool "when necessary".
+The exact sequence is the model's choice — the above is just a representative
+trajectory. On the live page the Description field is below the fold, so the
+model has to scroll and re-read the fields, which it works out on its own.
 
 ---
 
 ## 5. Why these choices
 
 - **Playwright over Puppeteer/Selenium.** First-class Python sync API, robust
-  auto-waiting, reliable screenshots, and simple Chromium management
-  (`playwright install`). Recommended by the assignment.
-- **Deterministic detection over an LLM.** The task is fully specified, so a
-  transparent scoring model is more reliable, free, offline, and instant —
-  exactly what you want for a graded live demo. The rubric's "Agent Intelligence"
-  criterion is met by the detection + decision logic, which explicitly permits
-  selector/visual approaches.
-- **DOM-reported coordinates feeding `click_on_screen(x, y)`.** Rather than
-  guessing pixel positions, the agent asks the page itself for each element's
-  centre, then clicks those coordinates. This combines the robustness of
-  selectors with the spirit of coordinate-based control the assignment requires.
-- **Label-tolerant matching + fallback.** Real forms rarely use the exact label
-  "Name"; the agent matches equivalents (title/subject/username/…) and falls back
-  to the primary text field, so it succeeds on the live page out of the box.
+  auto-waiting, reliable screenshots, simple Chromium management. Recommended by
+  the assignment.
+- **Gemini with function calling + vision.** Coordinate-based control
+  (`click_on_screen`) is a *computer-use*-style problem; a multimodal model that
+  can both see screenshots and call typed tools is the natural fit, and function
+  calling keeps every action structured and logged.
+- **`get_form_fields` as perception, not decision.** Rather than make the model
+  guess pixel positions from an image, we let the page report each element's
+  centre and labels. The model still decides *which* field is which and *what* to
+  type — we only feed it accurate raw data to act on. This combines selector-grade
+  reliability with the required coordinate-based clicking.
+- **Screenshots in the loop.** Feeding the model a fresh image after each action
+  closes the perceive→decide→act loop, so it can recover from surprises (a field
+  scrolled out of view, an unexpected layout) rather than following a fixed plan.
 
 ---
 
@@ -136,20 +129,22 @@ before typing — demonstrating that tool "when necessary".
 
 | Risk | Mitigation |
 | ---- | ---------- |
-| Network / navigation timeout | Per-action timeout; raised as a `ToolError`. |
-| Element not found / off-screen | `scroll` + re-detect via `get_form_fields`; out-of-viewport click guard. |
-| Field labelled differently than "Name" | Keyword scoring + primary-text fallback. |
-| No form fields at all | Agent raises a clear `ToolError` instead of silently "succeeding". |
-| Any unexpected exception | Caught at the top level in `main.py`, logged with a full traceback. |
+| Network / navigation timeout | Per-action timeout; `ToolError` returned to the model as a tool error. |
+| Element not found / off-screen | Out-of-viewport click guard; the model scrolls and re-reads fields. |
+| Field labelled differently than "Name" | The model reasons from labels/types (e.g. treats "Bug Title" as the primary field). |
+| Model loops without finishing | `MAX_STEPS` cap ends the run gracefully. |
+| Model replies with text but no tool call | The loop nudges it to continue or finish. |
+| Any unexpected exception in a tool | Caught, logged with traceback, returned as an error tool result. |
 | Resource leaks | `BrowserController` is a context manager; the browser is always closed. |
 
 ---
 
 ## 7. Possible extensions
 
-- An optional LLM "planner" mode for free-form tasks ("fill whatever form is on
-  this page from this description") — the tool layer already supports it.
-- Form submission + post-submit verification as an opt-in step.
-- Fuzzy label matching (edit distance) for even more exotic field names.
-- A `press_key` tool for Tab-between-fields navigation.
-- Parameterising the task fully from a config file (arbitrary field → value map).
+- A `press_key` tool for Tab-between-fields navigation and arbitrary shortcuts.
+- Optional form submission + post-submit verification as a separate step.
+- Caching/condensing old screenshots to reduce token usage on long runs.
+- Letting the model drive entirely from screenshots (drop `get_form_fields`) for
+  a pure computer-use experiment.
+- Parameterising richer tasks via the `TASK` setting (the loop is already
+  task-driven).

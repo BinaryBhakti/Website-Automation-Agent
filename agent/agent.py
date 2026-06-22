@@ -1,262 +1,263 @@
 """
 agent.py
 ========
-The decision-making brain — **no API key, no LLM required**.
+The AI brain. ``AutomationAgent`` runs a manual Gemini function-calling loop in
+which **the model decides everything** — what to look at, which element is the
+Name field vs the Description field, what text to type, when to scroll, and when
+the task is done. Nothing about those decisions is hard-coded; the agent code
+only executes the tool calls the model asks for and feeds back the results.
 
-``AutomationAgent`` composes the modular browser tools into a workflow and makes
-its own decisions about *which* element is the "Name" field and *which* is the
-"Description" field. The intelligence is a transparent, deterministic scoring
-model over each field's label, placeholder, name, id and element type — exactly
-the "intelligent element identification using selectors / XPath" the assignment
-calls for, with none of the cost or flakiness of a remote model.
+    1. Gemini is given the task + the latest screenshot of the page.
+    2. Gemini reasons and decides which browser tool to call (open_browser,
+       navigate, get_form_fields, click_on_screen, send_keys, scroll, ...).
+    3. We execute the tool via ``BrowserController`` and return the result —
+       including a fresh screenshot — back to Gemini as a function response.
+    4. Repeat until Gemini calls ``finish`` or we hit MAX_STEPS.
 
-Workflow
---------
-    open_browser
-      └─► navigate_to_url(TARGET_URL)
-            └─► take_screenshot (before)
-                  └─► get_form_fields  ── intelligent detection + scoring
-                        ├─► fill Name field   (click_on_screen → send_keys)
-                        ├─► fill Description  (click_on_screen → send_keys)
-                        └─► take_screenshot (after) → done
-
-Every decision (scores, chosen coordinates, typed text) is logged so the run is
-fully auditable during the viva.
+This is the "agent intelligence" layer: element detection and decision-making
+are delegated to the model, which reasons over the screenshots and the structured
+field data returned by ``get_form_fields``.
 """
 
 from __future__ import annotations
 
+import base64
 import logging
-import re
-from dataclasses import dataclass
-from typing import Optional
+from typing import Any
+
+from google import genai
+from google.genai import types
 
 from config import Settings
 from .browser_tools import BrowserController, ToolError
+from .tool_schemas import TOOLS
 
 logger = logging.getLogger("agent.brain")
 
-
-# Keyword signals used to recognise each target field. Higher-weight keywords are
-# more specific. The scorer sums the weights of every keyword that appears in a
-# field's combined text (label + placeholder + name + id + aria-label).
-# NOTE: the assignment's "Name" field maps to the form's primary single-line
-# identifier. On the live target page that field is labelled "Bug Title", so the
-# keyword set covers name/title/subject. If none match, _locate_field falls back
-# to the topmost single-line text input (see _fallback_primary_text).
-_NAME_KEYWORDS = {
-    "name": 5,
-    "full name": 6,
-    "your name": 6,
-    "username": 4,
-    "first name": 4,
-    "fullname": 5,
-    "title": 5,
-    "subject": 3,
-}
-_DESCRIPTION_KEYWORDS = {
-    "description": 6,
-    "desc": 4,
-    "about": 4,
-    "bio": 4,
-    "message": 3,
-    "details": 3,
-    "comment": 3,
-    "summary": 3,
-    "notes": 2,
+# Tools whose effect is visual: after running them we attach a fresh screenshot
+# to the function response so the model always "sees" the current page state.
+_VISUAL_TOOLS = {
+    "navigate_to_url",
+    "click_on_screen",
+    "double_click",
+    "send_keys",
+    "scroll",
 }
 
+SYSTEM_PROMPT = """\
+You are an autonomous website automation agent that controls a real Chromium \
+browser through a small set of tools. You think for yourself: look at the page, \
+reason about what you see, decide the single best next action, perform it, then \
+look again. You — not any script — decide which element is which and what to type.
 
-@dataclass
-class FieldMatch:
-    """A detected field chosen as the best candidate for a target role."""
+General method:
+- Begin by calling open_browser, then navigate_to_url to the target URL.
+- Use take_screenshot to SEE the page, and get_form_fields to read the raw list \
+of fields (labels, placeholders, names, types and exact click coordinates).
+- Reason about which field is the Name (or primary/title) field and which is the \
+Description field. Labels may not be literally "Name" — use your judgement \
+(e.g. a "Title"/"Bug Title" input is the primary/name field; a textarea is \
+usually the description).
+- To fill a field: click_on_screen at its (x, y) to focus it, then send_keys with \
+your chosen text (use clear_first=true to overwrite any existing content).
+- If a needed field is not visible, scroll to bring it into view, then call \
+get_form_fields again (coordinates are viewport-relative and change after scrolling).
+- After filling, verify with get_form_fields or a screenshot that the values are \
+present, then call finish with a brief summary.
+- Take exactly one logical step at a time and inspect the result before the next.
 
-    role: str            # "name" or "description"
-    field: dict          # the raw field dict from get_form_fields
-    score: float         # how confident we are in this match
+Be decisive and efficient. Choose realistic values yourself. Do not submit the \
+form unless the task explicitly asks you to.\
+"""
 
 
 class AutomationAgent:
-    """Deterministically detects and fills the Name and Description fields."""
+    """Orchestrates Gemini + the browser tools to complete the target task."""
 
     def __init__(self, settings: Settings, browser: BrowserController) -> None:
         self.settings = settings
         self.browser = browser
+        self.client = genai.Client(api_key=settings.gemini_api_key)
+
+        # Tool config handed to Gemini on every request.
+        self._gen_config = types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            tools=[types.Tool(function_declarations=TOOLS)],
+            temperature=0,
+        )
+
+        # Dispatch table: tool name -> bound BrowserController method.
+        self._dispatch = {
+            "open_browser": lambda **kw: self.browser.open_browser(),
+            "navigate_to_url": lambda **kw: self.browser.navigate_to_url(kw["url"]),
+            "take_screenshot": lambda **kw: self.browser.take_screenshot(kw.get("label", "step")),
+            "get_form_fields": lambda **kw: self.browser.get_form_fields(),
+            "click_on_screen": lambda **kw: self.browser.click_on_screen(int(kw["x"]), int(kw["y"])),
+            "double_click": lambda **kw: self.browser.double_click(int(kw["x"]), int(kw["y"])),
+            "send_keys": lambda **kw: self.browser.send_keys(
+                kw["text"],
+                clear_first=bool(kw.get("clear_first", False)),
+                press_enter=bool(kw.get("press_enter", False)),
+            ),
+            "scroll": lambda **kw: self.browser.scroll(
+                kw.get("direction", "down"), int(kw.get("amount", 500))
+            ),
+        }
 
     # ----- public entry point -------------------------------------------- #
     def run(self) -> str:
-        """Execute the full workflow. Returns a human-readable summary."""
-        logger.info("Agent starting deterministic form-automation workflow.")
+        """Drive the agent loop to completion. Returns the final summary text."""
+        contents: list[types.Content] = [
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part(
+                        text=(
+                            "Start the task now.\n"
+                            f"Target URL: {self.settings.target_url}\n"
+                            f"Task: {self.settings.task}\n"
+                            "Open the browser, navigate there, decide which fields to "
+                            "fill, and complete the task."
+                        )
+                    )
+                ],
+            )
+        ]
 
-        # 1. Launch + navigate.
-        self.browser.open_browser()
-        nav = self.browser.navigate_to_url(self.settings.target_url)
-        logger.info("Loaded page: %s", nav.get("title") or nav.get("url"))
-        self.browser.take_screenshot(label="before_fill")
-
-        # 2. Detect the Description field first (its keyword is highly specific),
-        #    then the Name/primary field, excluding the description so the two
-        #    never collide.
-        desc_match = self._locate_field("description")
-        exclude = desc_match.field.get("index") if desc_match else None
-        name_match = self._locate_field("name", exclude_index=exclude)
-
-        if name_match is None and desc_match is None:
-            raise ToolError(
-                "Could not detect a Name or Description field on the page. "
-                "The page structure may have changed."
+        for step in range(1, self.settings.max_steps + 1):
+            logger.info("─── Step %d/%d ───", step, self.settings.max_steps)
+            response = self.client.models.generate_content(
+                model=self.settings.model,
+                contents=contents,
+                config=self._gen_config,
             )
 
-        # 3. Fill each field we found.
-        filled = []
-        if name_match is not None:
-            self._fill(name_match, self.settings.name_value)
-            filled.append("Name")
-        else:
-            logger.warning("No Name field detected — skipping.")
+            model_content = self._extract_content(response)
+            if model_content is None:
+                logger.warning("Model returned no content (possibly blocked). Stopping.")
+                return "Stopped: the model returned no usable content."
 
-        if desc_match is not None:
-            self._fill(desc_match, self.settings.description_value)
-            filled.append("Description")
-        else:
-            logger.warning("No Description field detected — skipping.")
+            self._log_text_parts(model_content)
+            # Preserve the model turn verbatim in the conversation history.
+            contents.append(model_content)
 
-        # 4. Verify + capture the final state.
-        self._verify(name_match, desc_match)
-        self.browser.take_screenshot(label="after_fill")
+            function_calls = [p.function_call for p in (model_content.parts or []) if p.function_call]
 
-        summary = (
-            f"Filled {len(filled)} field(s): {', '.join(filled)}."
-            if filled
-            else "No fields were filled."
-        )
-        logger.info("✅ %s", summary)
-        return summary
-
-    # ----- intelligent detection ----------------------------------------- #
-    def _locate_field(
-        self, role: str, exclude_index: Optional[int] = None, _scrolled: bool = False
-    ) -> Optional[FieldMatch]:
-        """Find the best on-screen field for ``role`` ('name' or 'description').
-
-        Strategy:
-          1. Score every visible field by keyword + structure; take the best > 0.
-          2. For the 'name' role, if no keyword matches, fall back to the topmost
-             single-line text input (the form's primary field).
-          3. If still nothing and we haven't scrolled yet, scroll down once and
-             retry — the field may be below the fold (coordinates are viewport-
-             relative, so we must re-detect after scrolling).
-        """
-        fields = self.browser.get_form_fields()["fields"]
-        match = self._best_match(role, fields, exclude_index)
-
-        if match is None and role == "name":
-            match = self._fallback_primary_text(fields, exclude_index)
-            if match is not None:
-                logger.info("No explicit name/title keyword; using primary text input as Name.")
-
-        if match is None and not _scrolled:
-            logger.info("No %s field visible yet; scrolling to look further down.", role)
-            self.browser.scroll("down", 400)
-            return self._locate_field(role, exclude_index=exclude_index, _scrolled=True)
-
-        if match is not None:
-            logger.info(
-                "Detected %s field -> label=%r at (%d, %d) [score=%.1f]",
-                role, match.field.get("label", ""), match.field["x"], match.field["y"], match.score,
-            )
-        return match
-
-    def _best_match(
-        self, role: str, fields: list[dict], exclude_index: Optional[int] = None
-    ) -> Optional[FieldMatch]:
-        """Score every field for ``role`` and return the highest scorer (>0)."""
-        best: Optional[FieldMatch] = None
-        for f in fields:
-            if exclude_index is not None and f.get("index") == exclude_index:
+            if not function_calls:
+                # Model replied with text only — nudge it to keep using tools.
+                logger.info("Model produced no function call this turn; nudging.")
+                contents.append(
+                    types.Content(
+                        role="user",
+                        parts=[
+                            types.Part(
+                                text=(
+                                    "Continue by calling the browser tools to make "
+                                    "progress, or call finish if the task is complete."
+                                )
+                            )
+                        ],
+                    )
+                )
                 continue
-            score = self._score(role, f)
-            if score > 0 and (best is None or score > best.score):
-                best = FieldMatch(role=role, field=f, score=score)
-        return best
+
+            reply_parts: list[types.Part] = []
+            finished_summary: str | None = None
+
+            for fc in function_calls:
+                name = fc.name
+                args = dict(fc.args) if fc.args else {}
+
+                if name == "finish":
+                    finished_summary = args.get("summary", "Task complete.")
+                    reply_parts.append(
+                        types.Part.from_function_response(
+                            name=name, response={"status": "acknowledged"}
+                        )
+                    )
+                    continue
+
+                reply_parts.extend(self._execute_tool(name, args))
+
+            contents.append(types.Content(role="user", parts=reply_parts))
+
+            if finished_summary is not None:
+                logger.info("✅ Agent finished: %s", finished_summary)
+                return finished_summary
+
+        logger.warning("Reached MAX_STEPS without an explicit finish.")
+        return "Stopped after reaching the maximum number of steps."
+
+    # ----- helpers ------------------------------------------------------- #
+    def _execute_tool(self, name: str, args: dict) -> list[types.Part]:
+        """Run a single tool call and build its function-response part(s).
+
+        Returns a list because visual tools also append an image part so the
+        model can see the resulting page state.
+        """
+        logger.info("Tool call: %s(%s)", name, _fmt_args(args))
+
+        handler = self._dispatch.get(name)
+        if handler is None:
+            return [self._fn_response(name, {"status": "error", "message": f"Unknown tool: {name}"})]
+
+        try:
+            result = handler(**args)
+        except ToolError as exc:
+            logger.warning("Tool %s failed: %s", name, exc)
+            return [self._fn_response(name, {"status": "error", "message": str(exc)})]
+        except Exception as exc:  # noqa: BLE001 - report any failure back to model
+            logger.exception("Unexpected error in tool %s", name)
+            return [self._fn_response(name, {"status": "error", "message": f"Unexpected error: {exc}"})]
+
+        return self._build_parts(name, result)
+
+    def _build_parts(self, name: str, result: dict) -> list[types.Part]:
+        """Turn a tool's dict result into function-response (+ optional image) parts."""
+        parts: list[types.Part] = []
+
+        if name == "take_screenshot":
+            parts.append(self._fn_response(name, {"status": result["status"], "path": result["path"]}))
+            parts.append(self._image_part(result))
+            return parts
+
+        # Strip base64 from the textual response to avoid duplicating big payloads.
+        printable = {k: v for k, v in result.items() if k != "image_base64"}
+        parts.append(self._fn_response(name, printable))
+
+        # For visual actions, attach a fresh screenshot of the resulting state.
+        if name in _VISUAL_TOOLS:
+            try:
+                shot = self.browser.take_screenshot(label=f"after_{name}")
+                parts.append(self._image_part(shot))
+            except ToolError:
+                pass
+
+        return parts
 
     @staticmethod
-    def _fallback_primary_text(
-        fields: list[dict], exclude_index: Optional[int] = None
-    ) -> Optional[FieldMatch]:
-        """Pick the topmost single-line text input as the primary ('name') field.
+    def _fn_response(name: str, response: dict) -> types.Part:
+        return types.Part.from_function_response(name=name, response=response)
 
-        Used when a form has no field literally labelled Name/Title — we treat the
-        first ordinary text input (e.g. an email-free single-line box) as the
-        primary identifier the assignment calls "Name".
-        """
-        candidates = [
-            f
-            for f in fields
-            if f.get("tag") == "input"
-            and f.get("type") in ("", "text")
-            and f.get("index") != exclude_index
-        ]
+    @staticmethod
+    def _image_part(shot: dict) -> types.Part:
+        png_bytes = base64.b64decode(shot["image_base64"])
+        return types.Part.from_bytes(data=png_bytes, mime_type=shot["media_type"])
+
+    @staticmethod
+    def _extract_content(response: Any) -> types.Content | None:
+        candidates = getattr(response, "candidates", None)
         if not candidates:
             return None
-        # Topmost on screen = smallest y coordinate.
-        primary = min(candidates, key=lambda f: f.get("y", 1_000_000))
-        return FieldMatch(role="name", field=primary, score=0.5)
+        return candidates[0].content
 
     @staticmethod
-    def _score(role: str, field: dict) -> float:
-        """Compute how well ``field`` matches the target ``role``.
+    def _log_text_parts(content: types.Content) -> None:
+        for part in content.parts or []:
+            if getattr(part, "text", None) and part.text.strip():
+                logger.info("🤖 %s", part.text.strip())
 
-        Combines keyword matches across all of the field's text signals with a
-        small structural bonus: a <textarea> is more likely a Description, while a
-        single-line text <input> is more likely a Name.
-        """
-        haystack = " ".join(
-            str(field.get(k, ""))
-            for k in ("label", "placeholder", "name", "id", "aria_label")
-        ).lower()
-        haystack = re.sub(r"[^a-z0-9 ]+", " ", haystack)
 
-        keywords = _NAME_KEYWORDS if role == "name" else _DESCRIPTION_KEYWORDS
-        score = 0.0
-        for kw, weight in keywords.items():
-            if kw in haystack:
-                score += weight
-
-        is_textarea = field.get("tag") == "textarea"
-        if role == "description" and is_textarea:
-            score += 2  # textareas usually hold longer, descriptive text
-        if role == "name" and field.get("type") == "text" and not is_textarea:
-            score += 1
-        return score
-
-    # ----- manipulation -------------------------------------------------- #
-    def _fill(self, match: FieldMatch, text: str) -> None:
-        """Focus the matched field via coordinate click, then type ``text``.
-
-        Uses ``double_click`` when the field already contains text (to select a
-        word before overwriting) — demonstrating that tool "when necessary".
-        """
-        x, y = match.field["x"], match.field["y"]
-        existing = str(match.field.get("value", "")).strip()
-
-        if existing:
-            logger.info("%s field has existing text %r; double-clicking to select.",
-                        match.role, existing)
-            self.browser.double_click(x, y)
-        else:
-            self.browser.click_on_screen(x, y)
-
-        self.browser.send_keys(text, clear_first=True)
-        logger.info("Typed into %s field: %r", match.role, text)
-
-    # ----- verification -------------------------------------------------- #
-    def _verify(self, *matches: Optional[FieldMatch]) -> None:
-        """Re-read the page and confirm the chosen fields now hold our text."""
-        current = {f.get("index"): f for f in self.browser.get_form_fields()["fields"]}
-        for m in matches:
-            if m is None:
-                continue
-            now = current.get(m.field.get("index"))
-            value = (now or {}).get("value", "") if now else "(field no longer visible)"
-            logger.info("Verify %s field -> value now: %r", m.role, value)
+# ----- module-level helpers ---------------------------------------------- #
+def _fmt_args(args: dict) -> str:
+    return ", ".join(f"{k}={v!r}" for k, v in args.items())
