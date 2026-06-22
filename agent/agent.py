@@ -26,6 +26,7 @@ import logging
 from typing import Any
 
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 
 from config import Settings
@@ -33,6 +34,11 @@ from .browser_tools import BrowserController, ToolError
 from .tool_schemas import TOOLS
 
 logger = logging.getLogger("agent.brain")
+
+# HTTP status codes that mean "this model is unavailable right now" — quota
+# exhausted (429), overloaded (503) or transient server error (500). When we see
+# one, we rotate to the next model in the fallback chain.
+_FALLBACK_STATUS = {429, 500, 503}
 
 # Tools whose effect is visual: after running them we attach a fresh screenshot
 # to the function response so the model always "sees" the current page state.
@@ -78,6 +84,11 @@ class AutomationAgent:
         self.settings = settings
         self.browser = browser
         self.client = genai.Client(api_key=settings.gemini_api_key)
+
+        # Ordered model fallback chain + the index of the model in use.
+        self.models = list(settings.models)
+        self._model_idx = 0
+        logger.info("Model fallback chain: %s", " -> ".join(self.models))
 
         # Tool config handed to Gemini on every request.
         self._gen_config = types.GenerateContentConfig(
@@ -126,11 +137,12 @@ class AutomationAgent:
 
         for step in range(1, self.settings.max_steps + 1):
             logger.info("─── Step %d/%d ───", step, self.settings.max_steps)
-            response = self.client.models.generate_content(
-                model=self.settings.model,
-                contents=contents,
-                config=self._gen_config,
-            )
+            response = self._generate(contents)
+            if response is None:
+                return (
+                    "Stopped: every model in the fallback chain hit its quota / was "
+                    "unavailable. Add another GEMINI model or wait for the quota to reset."
+                )
 
             model_content = self._extract_content(response)
             if model_content is None:
@@ -187,6 +199,49 @@ class AutomationAgent:
 
         logger.warning("Reached MAX_STEPS without an explicit finish.")
         return "Stopped after reaching the maximum number of steps."
+
+    # ----- model call with fallback -------------------------------------- #
+    def _generate(self, contents: list[types.Content]):
+        """Call Gemini, rotating through the fallback chain on quota/overload.
+
+        Returns the response, or ``None`` if every remaining model is exhausted.
+        The chosen model is "sticky": once we fall back, later steps keep using
+        the new model instead of re-hitting the exhausted one.
+        """
+        last_exc: Exception | None = None
+        while self._model_idx < len(self.models):
+            model = self.models[self._model_idx]
+            try:
+                return self.client.models.generate_content(
+                    model=model, contents=contents, config=self._gen_config
+                )
+            except genai_errors.APIError as exc:
+                if self._is_fallback_error(exc) and self._model_idx < len(self.models) - 1:
+                    logger.warning(
+                        "Model %s unavailable (%s); falling back to '%s'.",
+                        model, getattr(exc, "code", "?"), self.models[self._model_idx + 1],
+                    )
+                    self._model_idx += 1
+                    last_exc = exc
+                    continue
+                # Either a non-fallback error, or the last model in the chain.
+                if self._is_fallback_error(exc):
+                    logger.error("Final model %s also exhausted/unavailable (%s).",
+                                 model, getattr(exc, "code", "?"))
+                    return None
+                raise
+        if last_exc is not None:
+            logger.error("All models exhausted. Last error: %s", last_exc)
+        return None
+
+    @staticmethod
+    def _is_fallback_error(exc: genai_errors.APIError) -> bool:
+        """True if the error means 'try a different model' (quota / overload)."""
+        code = getattr(exc, "code", None)
+        if code in _FALLBACK_STATUS:
+            return True
+        text = str(exc).upper()
+        return "RESOURCE_EXHAUSTED" in text or "UNAVAILABLE" in text or "429" in text
 
     # ----- helpers ------------------------------------------------------- #
     def _execute_tool(self, name: str, args: dict) -> list[types.Part]:

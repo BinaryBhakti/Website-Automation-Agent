@@ -171,7 +171,8 @@ INFO agent.brain   ✅ Agent finished: Filled the Bug Title and Description fiel
 | Variable            | Default                                               | Meaning                                  |
 | ------------------- | ----------------------------------------------------- | ---------------------------------------- |
 | `GEMINI_API_KEY`    | *(required)*                                          | Your Google Gemini API key               |
-| `GEMINI_MODEL`      | `gemini-2.5-flash`                                    | Model used for reasoning + vision        |
+| `GEMINI_MODEL`      | `gemini-2.5-flash`                                    | Primary model for reasoning + vision     |
+| `GEMINI_MODELS`     | *(auto chain)*                                        | Comma-separated fallback chain; on a quota error (429) the agent rotates to the next model |
 | `TARGET_URL`        | `https://ui.shadcn.com/docs/forms/react-hook-form`    | Page to automate                         |
 | `TASK`              | *(fill Name + Description)*                            | Free-form goal the AI decides how to do  |
 | `HEADLESS`          | `false`                                               | Show (`false`) or hide (`true`) the browser |
@@ -191,6 +192,7 @@ INFO agent.brain   ✅ Agent finished: Filled the Bug Title and Description fiel
 | `playwright ... Executable doesn't exist` | Run `python -m playwright install chromium`. |
 | Browser never opens | Ensure `HEADLESS=false`; check the log for launch errors. |
 | Agent loops or stops early | Raise `MAX_STEPS`, or try `GEMINI_MODEL=gemini-2.5-pro` for harder pages. |
+| `RESOURCE_EXHAUSTED` / quota / 429 | Each model has a separate free-tier quota — the agent automatically falls back through `GEMINI_MODELS` (flash → 2.0-flash → flash-lite → 2.0-flash-lite). If the whole chain is exhausted, wait for the daily quota to reset or add a key with billing. |
 
 ---
 

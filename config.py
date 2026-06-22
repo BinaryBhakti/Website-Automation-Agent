@@ -24,6 +24,41 @@ _DEFAULT_TASK = (
     "then fill both with sensible, realistic values. Do not submit the form."
 )
 
+# Fallback chain tried in order. Each Gemini model has its own separate free-tier
+# quota, so when one is exhausted (HTTP 429) the agent rotates to the next. All of
+# these support vision + function calling.
+_DEFAULT_MODEL_CHAIN = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash-lite",
+]
+
+
+def _get_model_chain() -> list[str]:
+    """Build the ordered list of models to try.
+
+    Priority:
+      1. ``GEMINI_MODELS`` — explicit comma-separated chain, used as-is.
+      2. ``GEMINI_MODEL``  — primary model, placed first, then the default chain.
+      3. The default chain.
+    Duplicates are removed while preserving order.
+    """
+    explicit = os.getenv("GEMINI_MODELS", "").strip()
+    if explicit:
+        chain = [m.strip() for m in explicit.split(",") if m.strip()]
+    else:
+        primary = os.getenv("GEMINI_MODEL", "").strip()
+        chain = ([primary] if primary else []) + _DEFAULT_MODEL_CHAIN
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for m in chain:
+        if m not in seen:
+            seen.add(m)
+            ordered.append(m)
+    return ordered
+
 
 def _get_bool(name: str, default: bool) -> bool:
     """Parse a boolean environment variable in a forgiving way."""
@@ -50,7 +85,14 @@ class Settings:
 
     # --- Google Gemini / model ---
     gemini_api_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", ""))
-    model: str = field(default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
+    # Ordered fallback chain. The first entry is the primary model; the rest are
+    # tried in turn when a model returns a quota / overload error.
+    models: list[str] = field(default_factory=_get_model_chain)
+
+    @property
+    def model(self) -> str:
+        """The primary (first) model — used for logging and as the starting point."""
+        return self.models[0] if self.models else "gemini-2.5-flash"
 
     # --- Target task ---
     target_url: str = field(
