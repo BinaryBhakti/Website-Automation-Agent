@@ -137,6 +137,11 @@ class AutomationAgent:
 
         for step in range(1, self.settings.max_steps + 1):
             logger.info("─── Step %d/%d ───", step, self.settings.max_steps)
+            # Keep only the most recent screenshot in context. Old screenshots are
+            # stale and just waste tokens (images are expensive), which is what
+            # exhausts the free-tier quota. The model only needs to see the current
+            # page state, which is always the latest image.
+            self._prune_old_images(contents)
             response = self._generate(contents)
             if response is None:
                 return (
@@ -199,6 +204,40 @@ class AutomationAgent:
 
         logger.warning("Reached MAX_STEPS without an explicit finish.")
         return "Stopped after reaching the maximum number of steps."
+
+    # ----- token-saving context management ------------------------------- #
+    @staticmethod
+    def _prune_old_images(contents: list[types.Content]) -> None:
+        """Strip image parts from every turn except the most recent one.
+
+        Resending a growing pile of old screenshots every step is the main cause
+        of free-tier quota exhaustion. We keep only the latest screenshot (the
+        current page) and replace older ones with a tiny text placeholder, leaving
+        all text / function-call / function-response parts intact.
+        """
+        # Find the index of the last content that still holds an image.
+        last_image_idx = -1
+        for i, content in enumerate(contents):
+            if any(getattr(p, "inline_data", None) is not None for p in (content.parts or [])):
+                last_image_idx = i
+
+        if last_image_idx < 0:
+            return  # no images yet
+
+        for i, content in enumerate(contents):
+            if i == last_image_idx:
+                continue  # keep the newest screenshot
+            new_parts = []
+            removed = False
+            for p in content.parts or []:
+                if getattr(p, "inline_data", None) is not None:
+                    removed = True  # drop this image
+                else:
+                    new_parts.append(p)
+            if removed:
+                if not new_parts:
+                    new_parts = [types.Part(text="[older screenshot omitted to save tokens]")]
+                content.parts = new_parts
 
     # ----- model call with fallback -------------------------------------- #
     def _generate(self, contents: list[types.Content]):
