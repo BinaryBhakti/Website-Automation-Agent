@@ -27,11 +27,13 @@ _DEFAULT_TASK = (
 # Fallback chain tried in order. Each Gemini model has its own separate free-tier
 # quota, so when one is exhausted (HTTP 429) the agent rotates to the next. All of
 # these support vision + function calling.
+# Ordered so the highest free-tier quota models are tried first (the free daily
+# limit on gemini-2.5-flash is only ~20 requests, so it goes last).
 _DEFAULT_MODEL_CHAIN = [
-    "gemini-2.5-flash",
+    "gemini-2.0-flash-lite",
     "gemini-2.0-flash",
     "gemini-2.5-flash-lite",
-    "gemini-2.0-flash-lite",
+    "gemini-2.5-flash",
 ]
 
 

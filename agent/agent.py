@@ -68,9 +68,15 @@ usually the description).
 your chosen text (use clear_first=true to overwrite any existing content).
 - If a needed field is not visible, scroll to bring it into view, then call \
 get_form_fields again (coordinates are viewport-relative and change after scrolling).
-- After filling, verify with get_form_fields or a screenshot that the values are \
-present, then call finish with a brief summary.
-- Take exactly one logical step at a time and inspect the result before the next.
+- After filling, verify with get_form_fields that the values are present, then \
+call finish with a brief summary.
+
+Be economical with tool calls (every call costs API quota):
+- You automatically receive a screenshot after each click/type/scroll, so you do \
+NOT need to call take_screenshot separately unless something looks wrong.
+- Call get_form_fields once to read all fields and coordinates; reuse those \
+coordinates to fill every field. Only re-read fields after you scroll.
+- Aim to complete the task in as few steps as possible.
 
 Be decisive and efficient. Choose realistic values yourself. Do not submit the \
 form unless the task explicitly asks you to.\
